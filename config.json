@@ -1,8 +1,8 @@
 {
   "optimization_mode": false,
   "drawdown_mode": false,
-  "start_date": "2026-07-21",
-  "end_date": "2026-08-19",
+  "start_date": "2026-10-15",
+  "end_date": "2026-10-23",
   "initial_balance": 1000.0,
   "risk": {
     "type": "percent",
@@ -29,7 +29,7 @@
     "min_book_liquidity_usd": 20.0,
     "min_seconds_left": 20
   },
-  "use_vetoes": false,
+  "use_vetoes": true,
   "fees": {
     "enabled": true,
     "fee_rate": 0.07
