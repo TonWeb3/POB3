@@ -1,0 +1,48 @@
+{
+  "optimization_mode": false,
+  "drawdown_mode": false,
+  "start_date": "2026-07-21",
+  "end_date": "2026-08-19",
+  "initial_balance": 1000.0,
+  "risk": {
+    "type": "percent",
+    "value": 10.0
+  },
+  "strategy": {
+    "ev_threshold": 0.04,
+    "min_prob": 0.55,
+    "min_entry_second": 0,
+    "max_entry_second": 45,
+    "max_entry_price": 0.58,
+    "min_entry_price": 0.40,
+    "prior_body_max_bp": 12.0,
+    "min_4h_move_pct": 0.50,
+    "impulse_1h_down_pct": -0.19,
+    "impulse_1h_up_pct": 0.32,
+    "circuit_breaker_losses": 2,
+    "pause_markets": 4,
+    "max_1h_vol_bp": 45.0,
+    "skip_hours": [
+      18,
+      23
+    ],
+    "min_book_liquidity_usd": 20.0,
+    "min_seconds_left": 20
+  },
+  "use_vetoes": false,
+  "fees": {
+    "enabled": true,
+    "fee_rate": 0.07
+  },
+  "flip": {
+    "enabled": false,
+    "min_conviction": 0.80,
+    "min_minutes_left": 9.0
+  },
+  "telonex": {
+    "api_key": "tlx_7548529f8f89f4481d93b5bdd399491d",
+    "base_url": "https://api.telonex.io/v1",
+    "data_dir": "data"
+  },
+  "output_dir": "results"
+}
