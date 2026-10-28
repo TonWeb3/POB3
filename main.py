@@ -26,15 +26,16 @@ from backtest import (
 )
 
 
-def print_banner(optimization_mode: bool, drawdown_mode: bool = False):
+def print_banner(optimization_mode: bool, drawdown_mode: bool = False, binance_futures: bool = False):
+    feed_label = "BINANCE FUTURES" if binance_futures else "BINANCE SPOT"
     if optimization_mode and drawdown_mode:
-        mode_text = "DUAL MODE: DRAWDOWN SUITE (Full EV) + OPTIMIZATION (15m Structure)"
+        mode_text = f"DUAL MODE: DRAWDOWN SUITE + OPTIMIZATION [{feed_label}]"
     elif optimization_mode:
-        mode_text = "OPTIMIZATION MODE (15m Structural Optimization Progression)"
+        mode_text = f"OPTIMIZATION MODE (15m Structural Optimization) [{feed_label}]"
     elif drawdown_mode:
-        mode_text = "DRAWDOWN SUITE MODE (Testing All Drawdown Filters on Full EV)"
+        mode_text = f"DRAWDOWN SUITE MODE (Testing All Drawdown Filters) [{feed_label}]"
     else:
-        mode_text = "SINGLE BACKTEST MODE (Original Strategy Baseline - Unfiltered EV Model)"
+        mode_text = f"SINGLE BACKTEST MODE (Original Strategy Baseline) [{feed_label}]"
     banner = f"""
 ================================================================================
           TOG-MAIN POLYMARKET BTC 15M QUANTITATIVE ENGINE
@@ -98,6 +99,8 @@ def display_single_results(results: dict):
     print("-" * 80)
     print(f" Total Markets        : {s.get('markets_evaluated'):,}")
     print(f" Executed Trades      : {s.get('total_trades'):,} ({s.get('trade_frequency_pct')}% market participation)")
+    if s.get("flips_count", 0) > 0:
+        print(f" Position Flips       : {s.get('flips_count', 0):,}")
     print(f" Vetoed Signals       : {s.get('veto_count'):,}")
     print(f" Win Rate             : {s.get('win_rate')}% ({s.get('winning_trades')} Wins / {s.get('losing_trades')} Losses)")
     print(f" Profit Factor        : {s.get('profit_factor')}")
@@ -145,7 +148,7 @@ def display_optimization_summary(suite_results: dict):
             "min_prob": float(best.get("params", {}).get("min_prob", 0.55)),
             "min_strike_distance_bp": float(best.get("params", {}).get("min_strike_distance_bp", 0.0)),
             "min_entry_second": int(best.get("params", {}).get("min_entry_second", 0)),
-            "max_entry_second": int(best.get("params", {}).get("max_entry_second", 840)),
+            "max_entry_second": int(best.get("params", {}).get("max_entry_second", 880)),
             "use_15m_ha": bool(best.get("params", {}).get("use_15m_ha", False)),
             "circuit_breaker_losses": int(best.get("params", {}).get("circuit_breaker_losses", 0)),
             "pause_markets": int(best.get("params", {}).get("pause_markets", 0)),
@@ -168,7 +171,8 @@ def main():
     cfg = load_config(str(cfg_path))
     optimization_mode = bool(cfg.get("optimization_mode", False))
     drawdown_mode = bool(cfg.get("drawdown_mode", False))
-    print_banner(optimization_mode, drawdown_mode)
+    binance_futures = bool(cfg.get("binance_futures", False))
+    print_banner(optimization_mode, drawdown_mode, binance_futures)
 
 
     output_dir = CURRENT_DIR / cfg.get("output_dir", "results")

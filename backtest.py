@@ -107,10 +107,15 @@ class FastMarketDataset:
         self.n_rows = len(df)
 
         # 1m indicators
-        self.rsi = compute_rsi(df["spot"].values, period=14)
-        ha_g, ha_r = compute_ha_streaks(df["spot"].values)
-        self.ha_green_streak = ha_g
-        self.ha_red_streak = ha_r
+        if "rsi" in df.columns and "ha_green_streak" in df.columns and "ha_red_streak" in df.columns:
+            self.rsi = df["rsi"].values
+            self.ha_green_streak = df["ha_green_streak"].values
+            self.ha_red_streak = df["ha_red_streak"].values
+        else:
+            self.rsi = compute_rsi(df["spot"].values, period=14)
+            ha_g, ha_r = compute_ha_streaks(df["spot"].values)
+            self.ha_green_streak = ha_g
+            self.ha_red_streak = ha_r
         self.move_bp = (df["spot"].values - df["strike"].values) / df["strike"].values * 10000.0
 
         # Market boundaries
@@ -234,8 +239,10 @@ def simulate_strategy_fast(
 
     ev_th = float(params.get("ev_threshold", 0.04))
     min_prob = float(params.get("min_prob", 0.55))
-    min_ts = int(params.get("min_entry_second", 0))
-    max_ts = int(params.get("max_entry_second", 840))
+    min_ts = int(params.get("min_entry_second", 0) or 0)
+    raw_max_ts = params.get("max_entry_second")
+    # Uncapped by default up to candle expiration (e.g. 880s)
+    max_ts = int(raw_max_ts) if (raw_max_ts is not None and int(raw_max_ts) > 0) else 880
     min_seconds_left = int(params.get("min_seconds_left", 20))
     min_bp = float(params.get("min_strike_distance_bp", 0.0))
     use_15m_ha = bool(params.get("use_15m_ha", False))
@@ -246,14 +253,22 @@ def simulate_strategy_fast(
         use_vetoes_opt = global_cfg.get("use_vetoes", True)
     use_vetoes = bool(use_vetoes_opt)
 
+    flip_opt = params.get("flip_enabled")
+    if flip_opt is None:
+        flip_opt = global_cfg.get("flip", {}).get("enabled", False)
+    flip_enabled = bool(flip_opt)
+    flip_conviction = float(params.get("flip_min_conviction", global_cfg.get("flip", {}).get("min_conviction", 0.80)))
+    flip_min_minutes = float(params.get("flip_min_minutes_left", global_cfg.get("flip", {}).get("min_minutes_left", 9.0)))
+    flip_min_seconds = flip_min_minutes * 60.0
+
     # Drawdown reduction & circuit breaker controls
     circuit_breaker_losses = int(params.get("circuit_breaker_losses", 0))
     pause_markets = int(params.get("pause_markets", 0))
     max_1h_vol_bp = float(params.get("max_1h_vol_bp", 0.0))
     prior_body_max_bp = float(params.get("prior_body_max_bp", 0.0))
-    strat_mode = str(params.get("strategy_mode", "immediate_open" if ("max_ask" in params or "prior_body_max_bp" in params or params.get("max_entry_second", 840) <= 45) else "ev_momentum")).strip().lower()
-    min_ask = float(params.get("min_ask", 0.40))
-    max_ask = float(params.get("max_ask", 0.58 if strat_mode == "immediate_open" else 1.0))
+    strat_mode = str(params.get("strategy_mode", "ev_momentum")).strip().lower()
+    min_ask = float(params.get("min_entry_price", params.get("min_ask", 0.0)))
+    max_ask = float(params.get("max_entry_price", params.get("max_ask", 1.0)))
     skip_hours = set(params.get("skip_hours", []))
     skip_days = set(params.get("skip_days", []))
     allowed_sessions = set(params.get("allowed_sessions", [])) if params.get("allowed_sessions") else None
@@ -283,6 +298,7 @@ def simulate_strategy_fast(
     won_list: List[bool] = []
     fees_paid = 0.0
     vetoed_count = 0
+    flips_count = 0
 
     up_pnls: List[float] = []
     down_pnls: List[float] = []
@@ -336,6 +352,7 @@ def simulate_strategy_fast(
         m_flat_bot = dataset.ha_flat_bottom[m_i]
         m_flat_top = dataset.ha_flat_top[m_i]
 
+        active_pos = None
         for k in range(s_idx, e_idx):
             t_s = dataset.t_s[k]
             tau_s = dataset.tau_s[k]
@@ -351,6 +368,7 @@ def simulate_strategy_fast(
                 continue
 
             down_ask = 1.0 - up_bid
+            down_bid = 1.0 - up_ask
             fair_down = 1.0 - fair_up
             ev_up = fair_up - up_ask
             ev_down = fair_down - down_ask
@@ -360,126 +378,319 @@ def simulate_strategy_fast(
             h_ev_up = ev_up - f_up
             h_ev_down = ev_down - f_down
 
-            if strat_mode == "immediate_open":
-                if m_flat_bot == m_flat_top:
-                    continue  # chop/neutral
-                side_is_up = bool(m_flat_bot)
-                ask_side = up_ask if side_is_up else down_ask
-                if ask_side > max_ask or ask_side < min_ask:
-                    continue
-                p_side = 0.671
-                raw_ev = p_side - ask_side
-                h_ev = raw_ev
-            else:
-                side_is_up = h_ev_up >= h_ev_down
-                h_ev = h_ev_up if side_is_up else h_ev_down
-                raw_ev = ev_up if side_is_up else ev_down
-                p_side = fair_up if side_is_up else fair_down
-                ask_side = up_ask if side_is_up else down_ask
-
-                # Drawdown Filter: High-Ask Capping (Protects against buying >80c where loss wipes out 5+ wins)
-                if max_ask < 1.0 and ask_side > max_ask:
-                    continue
-
-                # Filter 1: 1m/5m micro vetoes
-                if use_vetoes:
-                    rsi_val = dataset.rsi[k]
-                    if side_is_up and (rsi_val > 70.0 or dataset.ha_green_streak[k] >= 6):
-                        vetoed_count += 1
+            if active_pos is None:
+                # 1. EVALUATE INITIAL ENTRY
+                if strat_mode == "immediate_open":
+                    if m_flat_bot == m_flat_top:
+                        continue  # chop/neutral
+                    side_is_up = bool(m_flat_bot)
+                    ask_side = up_ask if side_is_up else down_ask
+                    if ask_side > max_ask or ask_side < min_ask:
                         continue
-                    if (not side_is_up) and (rsi_val < 30.0 or dataset.ha_red_streak[k] >= 6):
-                        vetoed_count += 1
+                    p_side = 0.671
+                    raw_ev = p_side - ask_side
+                    h_ev = raw_ev
+                else:
+                    side_is_up = h_ev_up >= h_ev_down
+                    h_ev = h_ev_up if side_is_up else h_ev_down
+                    raw_ev = ev_up if side_is_up else ev_down
+                    p_side = fair_up if side_is_up else fair_down
+                    ask_side = up_ask if side_is_up else down_ask
+
+                    # Drawdown Filter: High-Ask Capping (Protects against buying >80c where loss wipes out 5+ wins)
+                    if max_ask < 1.0 and ask_side > max_ask:
                         continue
 
-                # Filter 2: 15m Moneyness / Strike Distance
-                if min_bp > 0:
-                    mbp = dataset.move_bp[k]
-                    if side_is_up and mbp < min_bp:
-                        continue
-                    if (not side_is_up) and mbp > -min_bp:
-                        continue
+                    # Filter 1: 1m/5m micro vetoes
+                    if use_vetoes:
+                        rsi_val = dataset.rsi[k]
+                        if side_is_up and (rsi_val > 70.0 or dataset.ha_green_streak[k] >= 6):
+                            vetoed_count += 1
+                            continue
+                        if (not side_is_up) and (rsi_val < 30.0 or dataset.ha_red_streak[k] >= 6):
+                            vetoed_count += 1
+                            continue
 
-                # Filter 3: 15m Structural Heiken-Ashi
-                if use_15m_ha:
-                    if (not side_is_up) and m_flat_bot:
-                        continue
-                    if side_is_up and m_flat_top:
-                        continue
+                    # Filter 2: 15m Moneyness / Strike Distance
+                    if min_bp > 0:
+                        mbp = dataset.move_bp[k]
+                        if side_is_up and mbp < min_bp:
+                            continue
+                        if (not side_is_up) and mbp > -min_bp:
+                            continue
 
-                # Filter 4: 15m Trend EMA
-                if use_15m_trend:
-                    if side_is_up and (not m_trend_bull):
-                        continue
-                    if (not side_is_up) and m_trend_bull:
-                        continue
+                    # Filter 3: 15m Structural Heiken-Ashi
+                    if use_15m_ha:
+                        if (not side_is_up) and m_flat_bot:
+                            continue
+                        if side_is_up and m_flat_top:
+                            continue
 
-            # Edge & Probability Gating
-            if (strat_mode == "immediate_open") or (h_ev >= ev_th and p_side >= min_prob):
-                if risk_type == "percent":
-                    # Compounding percent of balance with Polymarket $1.00 minimum order floor
-                    if current_balance > 1.0:
-                        stake = max(1.0, current_balance * (risk_value / 100.0))
+                    # Filter 4: 15m Trend EMA
+                    if use_15m_trend:
+                        if side_is_up and (not m_trend_bull):
+                            continue
+                        if (not side_is_up) and m_trend_bull:
+                            continue
+
+                # Edge & Probability Gating
+                if (strat_mode == "immediate_open") or (h_ev >= ev_th and p_side >= min_prob):
+                    if risk_type == "percent":
+                        # Compounding percent of balance with Polymarket $1.00 minimum order floor
+                        if current_balance > 1.0:
+                            stake = max(1.0, current_balance * (risk_value / 100.0))
+                        else:
+                            stake = 1.0  # Minimum viable trade size to evaluate full historical dataset without premature truncation
                     else:
-                        stake = 1.0  # Minimum viable trade size to evaluate full historical dataset without premature truncation
-                else:
-                    stake = max(1.0, float(risk_value))
+                        stake = max(1.0, float(risk_value))
 
-                shares = stake / ask_side
-                entry_fee = (shares * fee_rate * ask_side * (1.0 - ask_side)) if fees_enabled else 0.0
-                won = (side_is_up and m_up_won) or ((not side_is_up) and (not m_up_won))
-                payout = shares if won else 0.0
-                trade_pnl = payout - stake - entry_fee
-                current_balance += trade_pnl
-                fees_paid += entry_fee
-                pnl_list.append(trade_pnl)
-                won_list.append(won)
+                    shares = stake / ask_side
+                    entry_fee = (shares * fee_rate * ask_side * (1.0 - ask_side)) if fees_enabled else 0.0
 
-                # Circuit breaker tracking: cooldown after N consecutive losses
-                if won:
+                    if not flip_enabled:
+                        won = (side_is_up and m_up_won) or ((not side_is_up) and (not m_up_won))
+                        payout = shares if won else 0.0
+                        trade_pnl = payout - stake - entry_fee
+                        current_balance += trade_pnl
+                        fees_paid += entry_fee
+                        pnl_list.append(trade_pnl)
+                        won_list.append(won)
+
+                        # Circuit breaker tracking: cooldown after N consecutive losses
+                        if won:
+                            consec_losses = 0
+                        else:
+                            consec_losses += 1
+                            if circuit_breaker_losses > 0 and consec_losses >= circuit_breaker_losses:
+                                pause_until_mkt = m_i + pause_markets + 1
+                                consec_losses = 0
+
+                        if side_is_up:
+                            up_pnls.append(trade_pnl)
+                            up_wons.append(won)
+                        else:
+                            down_pnls.append(trade_pnl)
+                            down_wons.append(won)
+
+                        if current_balance > peak_balance:
+                            peak_balance = current_balance
+                        dd = peak_balance - current_balance
+                        dd_pct = (dd / peak_balance) * 100.0 if peak_balance > 0 else 0.0
+                        if dd > max_drawdown:
+                            max_drawdown = dd
+                        if dd_pct > max_drawdown_pct:
+                            max_drawdown_pct = dd_pct
+
+                        trades.append({
+                            "slug": dataset.mkt_slugs[m_i],
+                            "side": "UP" if side_is_up else "DOWN",
+                            "entry_t_s": t_s,
+                            "tau_remaining_s": tau_s,
+                            "spot": dataset.spot[k],
+                            "strike": dataset.strike[k],
+                            "move_bp": round(dataset.move_bp[k], 2),
+                            "fair_prob": round(p_side, 4),
+                            "entry_price": round(ask_side, 4),
+                            "ev": round(raw_ev, 4),
+                            "stake": round(stake, 2),
+                            "shares": round(shares, 2),
+                            "fee": round(entry_fee, 2),
+                            "won": won,
+                            "payout": round(payout, 2),
+                            "pnl": round(trade_pnl, 2),
+                            "return_pct": round((trade_pnl / stake) * 100.0, 2),
+                            "balance_after": round(current_balance, 2)
+                        })
+                        break
+                    else:
+                        active_pos = {
+                            "side_is_up": side_is_up,
+                            "stake": stake,
+                            "shares": shares,
+                            "entry_fee": entry_fee,
+                            "entry_price": ask_side,
+                            "entry_t_s": t_s,
+                            "tau_remaining_s": tau_s,
+                            "spot": dataset.spot[k],
+                            "strike": dataset.strike[k],
+                            "move_bp": dataset.move_bp[k],
+                            "fair_prob": p_side,
+                            "ev": raw_ev
+                        }
+            else:
+                # 2. EVALUATE POSITION FLIP (Only if remaining time >= flip_min_minutes)
+                if tau_s >= flip_min_seconds:
+                    opp_side_is_up = not active_pos["side_is_up"]
+                    opp_p = fair_up if opp_side_is_up else fair_down
+                    opp_ev = h_ev_up if opp_side_is_up else h_ev_down
+                    opp_raw_ev = ev_up if opp_side_is_up else ev_down
+                    opp_ask = up_ask if opp_side_is_up else down_ask
+
+                    # High conviction reversal signal required
+                    if opp_p >= flip_conviction and opp_ev >= ev_th:
+                        opp_vetoed = False
+                        if use_vetoes:
+                            rsi_val = dataset.rsi[k]
+                            if opp_side_is_up and (rsi_val > 70.0 or dataset.ha_green_streak[k] >= 6):
+                                vetoed_count += 1
+                                opp_vetoed = True
+                            if (not opp_side_is_up) and (rsi_val < 30.0 or dataset.ha_red_streak[k] >= 6):
+                                vetoed_count += 1
+                                opp_vetoed = True
+
+                        if min_bp > 0:
+                            mbp = dataset.move_bp[k]
+                            if opp_side_is_up and mbp < min_bp:
+                                opp_vetoed = True
+                            if (not opp_side_is_up) and mbp > -min_bp:
+                                opp_vetoed = True
+
+                        if use_15m_ha:
+                            if (not opp_side_is_up) and m_flat_bot:
+                                opp_vetoed = True
+                            if opp_side_is_up and m_flat_top:
+                                opp_vetoed = True
+
+                        if not opp_vetoed:
+                            # Close held position at CLOB bid
+                            sell_price = up_bid if active_pos["side_is_up"] else down_bid
+                            payout = active_pos["shares"] * sell_price
+                            exit_fee = (active_pos["shares"] * fee_rate * sell_price * (1.0 - sell_price)) if fees_enabled else 0.0
+                            trade_pnl = payout - active_pos["stake"] - active_pos["entry_fee"] - exit_fee
+                            won = trade_pnl > 0.0
+                            current_balance += trade_pnl
+                            fees_paid += (active_pos["entry_fee"] + exit_fee)
+                            pnl_list.append(trade_pnl)
+                            won_list.append(won)
+
+                            if won:
+                                consec_losses = 0
+                            else:
+                                consec_losses += 1
+                                if circuit_breaker_losses > 0 and consec_losses >= circuit_breaker_losses:
+                                    pause_until_mkt = m_i + pause_markets + 1
+                                    consec_losses = 0
+
+                            if active_pos["side_is_up"]:
+                                up_pnls.append(trade_pnl)
+                                up_wons.append(won)
+                            else:
+                                down_pnls.append(trade_pnl)
+                                down_wons.append(won)
+
+                            if current_balance > peak_balance:
+                                peak_balance = current_balance
+                            dd = peak_balance - current_balance
+                            dd_pct = (dd / peak_balance) * 100.0 if peak_balance > 0 else 0.0
+                            if dd > max_drawdown:
+                                max_drawdown = dd
+                            if dd_pct > max_drawdown_pct:
+                                max_drawdown_pct = dd_pct
+
+                            trades.append({
+                                "slug": dataset.mkt_slugs[m_i],
+                                "side": "UP" if active_pos["side_is_up"] else "DOWN",
+                                "entry_t_s": active_pos["entry_t_s"],
+                                "tau_remaining_s": active_pos["tau_remaining_s"],
+                                "spot": active_pos["spot"],
+                                "strike": active_pos["strike"],
+                                "move_bp": round(active_pos["move_bp"], 2),
+                                "fair_prob": round(active_pos["fair_prob"], 4),
+                                "entry_price": round(active_pos["entry_price"], 4),
+                                "ev": round(active_pos["ev"], 4),
+                                "stake": round(active_pos["stake"], 2),
+                                "shares": round(active_pos["shares"], 2),
+                                "fee": round(active_pos["entry_fee"] + exit_fee, 2),
+                                "won": won,
+                                "payout": round(payout, 2),
+                                "pnl": round(trade_pnl, 2),
+                                "return_pct": round((trade_pnl / active_pos["stake"]) * 100.0, 2),
+                                "balance_after": round(current_balance, 2)
+                            })
+
+                            flips_count += 1
+
+                            # Enter new opposite position
+                            if risk_type == "percent":
+                                if current_balance > 1.0:
+                                    stake = max(1.0, current_balance * (risk_value / 100.0))
+                                else:
+                                    stake = 1.0
+                            else:
+                                stake = max(1.0, float(risk_value))
+
+                            new_shares = stake / opp_ask
+                            new_entry_fee = (new_shares * fee_rate * opp_ask * (1.0 - opp_ask)) if fees_enabled else 0.0
+                            active_pos = {
+                                "side_is_up": opp_side_is_up,
+                                "stake": stake,
+                                "shares": new_shares,
+                                "entry_fee": new_entry_fee,
+                                "entry_price": opp_ask,
+                                "entry_t_s": t_s,
+                                "tau_remaining_s": tau_s,
+                                "spot": dataset.spot[k],
+                                "strike": dataset.strike[k],
+                                "move_bp": dataset.move_bp[k],
+                                "fair_prob": opp_p,
+                                "ev": opp_raw_ev
+                            }
+
+        # END OF MARKET TICK LOOP: Settle active position at expiry if flip mode kept it open
+        if active_pos is not None:
+            side_is_up = active_pos["side_is_up"]
+            won = (side_is_up and m_up_won) or ((not side_is_up) and (not m_up_won))
+            payout = active_pos["shares"] if won else 0.0
+            trade_pnl = payout - active_pos["stake"] - active_pos["entry_fee"]
+            current_balance += trade_pnl
+            fees_paid += active_pos["entry_fee"]
+            pnl_list.append(trade_pnl)
+            won_list.append(won)
+
+            if won:
+                consec_losses = 0
+            else:
+                consec_losses += 1
+                if circuit_breaker_losses > 0 and consec_losses >= circuit_breaker_losses:
+                    pause_until_mkt = m_i + pause_markets + 1
                     consec_losses = 0
-                else:
-                    consec_losses += 1
-                    if circuit_breaker_losses > 0 and consec_losses >= circuit_breaker_losses:
-                        pause_until_mkt = m_i + pause_markets + 1
-                        consec_losses = 0
 
-                if side_is_up:
-                    up_pnls.append(trade_pnl)
-                    up_wons.append(won)
-                else:
-                    down_pnls.append(trade_pnl)
-                    down_wons.append(won)
+            if side_is_up:
+                up_pnls.append(trade_pnl)
+                up_wons.append(won)
+            else:
+                down_pnls.append(trade_pnl)
+                down_wons.append(won)
 
-                if current_balance > peak_balance:
-                    peak_balance = current_balance
-                dd = peak_balance - current_balance
-                dd_pct = (dd / peak_balance) * 100.0 if peak_balance > 0 else 0.0
-                if dd > max_drawdown:
-                    max_drawdown = dd
-                if dd_pct > max_drawdown_pct:
-                    max_drawdown_pct = dd_pct
+            if current_balance > peak_balance:
+                peak_balance = current_balance
+            dd = peak_balance - current_balance
+            dd_pct = (dd / peak_balance) * 100.0 if peak_balance > 0 else 0.0
+            if dd > max_drawdown:
+                max_drawdown = dd
+            if dd_pct > max_drawdown_pct:
+                max_drawdown_pct = dd_pct
 
-                trades.append({
-                    "slug": dataset.mkt_slugs[m_i],
-                    "side": "UP" if side_is_up else "DOWN",
-                    "entry_t_s": t_s,
-                    "tau_remaining_s": tau_s,
-                    "spot": dataset.spot[k],
-                    "strike": dataset.strike[k],
-                    "move_bp": round(dataset.move_bp[k], 2),
-                    "fair_prob": round(p_side, 4),
-                    "entry_price": round(ask_side, 4),
-                    "ev": round(raw_ev, 4),
-                    "stake": round(stake, 2),
-                    "shares": round(shares, 2),
-                    "fee": round(entry_fee, 2),
-                    "won": won,
-                    "payout": round(payout, 2),
-                    "pnl": round(trade_pnl, 2),
-                    "return_pct": round((trade_pnl / stake) * 100.0, 2),
-                    "balance_after": round(current_balance, 2)
-                })
-                break
+            trades.append({
+                "slug": dataset.mkt_slugs[m_i],
+                "side": "UP" if side_is_up else "DOWN",
+                "entry_t_s": active_pos["entry_t_s"],
+                "tau_remaining_s": active_pos["tau_remaining_s"],
+                "spot": active_pos["spot"],
+                "strike": active_pos["strike"],
+                "move_bp": round(active_pos["move_bp"], 2),
+                "fair_prob": round(active_pos["fair_prob"], 4),
+                "entry_price": round(active_pos["entry_price"], 4),
+                "ev": round(active_pos["ev"], 4),
+                "stake": round(active_pos["stake"], 2),
+                "shares": round(active_pos["shares"], 2),
+                "fee": round(active_pos["entry_fee"], 2),
+                "won": won,
+                "payout": round(payout, 2),
+                "pnl": round(trade_pnl, 2),
+                "return_pct": round((trade_pnl / active_pos["stake"]) * 100.0, 2),
+                "balance_after": round(current_balance, 2)
+            })
 
     n = len(pnl_list)
     if n == 0:
@@ -508,6 +719,7 @@ def simulate_strategy_fast(
             "total_fees_paid": 0.0,
             "sharpe_ratio": 0.0,
             "vetoed_count": vetoed_count,
+            "flips_count": flips_count,
             "up_trades": 0,
             "up_win_rate": 0.0,
             "up_pnl": 0.0,
@@ -562,6 +774,7 @@ def simulate_strategy_fast(
         "total_fees_paid": round(fees_paid, 2),
         "sharpe_ratio": round(sharpe, 2),
         "vetoed_count": vetoed_count,
+        "flips_count": flips_count,
         "up_trades": len(up_pnls),
         "up_win_rate": round(float(np.mean(up_wons)) * 100.0, 1) if up_wons else 0.0,
         "up_pnl": round(sum(up_pnls), 2),
@@ -589,7 +802,8 @@ def analyze_regimes_fast(dataset: FastMarketDataset, global_cfg: Dict[str, Any])
         for k in range(s_idx, e_idx):
             t_s = dataset.t_s[k]
             tau_s = dataset.tau_s[k]
-            if t_s > 840 or tau_s < 20:
+            max_entry_sec = int(global_cfg.get("strategy", {}).get("max_entry_second", 880))
+            if t_s > max_entry_sec or tau_s < 20:
                 continue
 
             fair_up = dataset.fair_up[k]
@@ -693,178 +907,144 @@ def analyze_regimes_fast(dataset: FastMarketDataset, global_cfg: Dict[str, Any])
     }
 
 
-def define_optimization_matrix() -> List[Dict[str, Any]]:
-    """Defines the Drawdown Reduction Progression matrix (risk held constant with config.json)."""
+def define_optimization_matrix(strat_cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Defines the Drawdown Reduction Progression matrix anchored on the authentic live EV engine."""
+    if strat_cfg is None:
+        strat_cfg = {}
+    ev_th = float(strat_cfg.get("ev_threshold", 0.04))
+    min_prob = float(strat_cfg.get("min_prob", 0.55))
+    min_ts = int(strat_cfg.get("min_entry_second", 0) or 0)
+    max_ts = int(strat_cfg.get("max_entry_second", 880))
+    min_seconds_left = int(strat_cfg.get("min_seconds_left", 20))
+
+    base_ev = {
+        "strategy_mode": "ev_momentum",
+        "ev_threshold": ev_th,
+        "min_prob": min_prob,
+        "min_entry_second": min_ts,
+        "max_entry_second": max_ts,
+        "min_seconds_left": min_seconds_left,
+        "min_strike_distance_bp": 0.0,
+        "use_15m_ha": False,
+        "use_15m_trend_ema": False,
+        "net_ev_gate": False,
+        "prior_body_max_bp": 0.0,
+        "min_ask": 0.0,
+        "max_ask": 1.0,
+    }
+
     return [
         {
-            "id": "dd00_original_ev_baseline",
-            "name": "Stage 0: Original EV Baseline (0 bp Moneyness, Unfiltered 0-840s)",
+            "id": "opt00_original_ev_baseline",
+            "name": "Stage 0: Original EV Baseline (0 bp Moneyness, Unfiltered)",
             "category": "Stage 0: Original Strategy Baseline",
-            "description": "Original TOG EV latency-arbitrage model across full 0-840s window with NO moneyness gate, NO 15m HA structure, and NO pause filters. The unmitigated reference benchmark.",
-            "params": {"min_strike_distance_bp": 0.0, "use_15m_ha": False, "min_entry_second": 0, "max_entry_second": 840}
+            "description": "Original TOG EV latency-arbitrage model across full window with NO moneyness gate, NO 15m HA structure, and NO pause filters. The unmitigated reference benchmark.",
+            "params": dict(base_ev)
         },
         {
-            "id": "dd00_moneyness_gate_alone",
-            "name": "Stage 0.5: Moneyness Gate Alone (>= 6 bp Strike Distance)",
-            "category": "Stage 0: Moneyness Filter",
-            "description": "Original EV model with Moneyness Gate (>= 6 bp strike distance lead) across 0-840s window. Directly isolates the impact of the Moneyness Gate against near-the-money chop.",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": False, "min_entry_second": 0, "max_entry_second": 840}
+            "id": "opt01_moneyness_gate_alone",
+            "name": "Stage 1: Moneyness Gate Alone (>= 6 bp Strike Distance)",
+            "category": "Stage 1: Moneyness Filter",
+            "description": "Original EV model with Moneyness Gate (>= 6 bp strike distance lead). Directly isolates the impact of the Moneyness Gate against near-the-money chop.",
+            "params": {**base_ev, "min_strike_distance_bp": 6.0}
         },
         {
-            "id": "dd00_apex_unprotected",
-            "name": "Stage 0.7: Apex Baseline (6 bp Moneyness + 15m HA + 90s-600s Timing)",
-            "category": "Stage 0: Unprotected Baseline",
-            "description": "Apex Strategy (6 bp Moneyness + 15m HA + 90s-600s timing) with NO pause filters or volatility gates.",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600}
-        },
-        {
-            "id": "dd01_circuit_breaker_1h",
-            "name": "Stage 1: Circuit Breaker Alone (1h Pause after 2 Losses)",
-            "category": "Stage 1: Pause Filter",
+            "id": "opt02_circuit_breaker_1h",
+            "name": "Stage 2: Circuit Breaker Alone (1h Pause after 2 Losses)",
+            "category": "Stage 2: Pause Filter",
             "description": "Automatically pauses trading for 4 markets (1 hour) after 2 consecutive losses. Isolates the impact of a cooldown pause.",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "circuit_breaker_losses": 2, "pause_markets": 4}
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4}
         },
         {
-            "id": "dd02_circuit_breaker_1_5h",
-            "name": "Stage 2: Extended Circuit Breaker (1.5h Pause after 2 Losses)",
-            "category": "Stage 1: Pause Filter",
+            "id": "opt03_circuit_breaker_1_5h",
+            "name": "Stage 3: Extended Circuit Breaker (1.5h Pause after 2 Losses)",
+            "category": "Stage 2: Pause Filter",
             "description": "Extended cooldown: pauses trading for 6 markets (1.5 hours) after 2 consecutive losses to fully clear multi-hour consolidation chop.",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "circuit_breaker_losses": 2, "pause_markets": 6}
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 6}
         },
         {
-            "id": "dd03_volatility_gate_45bp",
-            "name": "Stage 3: Volatility Gate Alone (<45 bp 1h ATR)",
-            "category": "Stage 2: Volatility Filter",
+            "id": "opt04_volatility_gate_45bp",
+            "name": "Stage 4: Volatility Gate Alone (<45 bp 1h ATR)",
+            "category": "Stage 3: Volatility Filter",
             "description": "Automatically pauses trading whenever trailing 1-hour realized ATR exceeds 45 basis points (bypasses sudden news spikes & market flash crashes).",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "max_1h_vol_bp": 45.0}
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "max_1h_vol_bp": 45.0}
         },
         {
-            "id": "dd04_volatility_gate_40bp",
-            "name": "Stage 4: Stricter Volatility Gate Alone (<40 bp 1h ATR)",
-            "category": "Stage 2: Volatility Filter",
+            "id": "opt05_volatility_gate_40bp",
+            "name": "Stage 5: Stricter Volatility Gate Alone (<40 bp 1h ATR)",
+            "category": "Stage 3: Volatility Filter",
             "description": "Stricter volatility ceiling (<40 bp 1h ATR) to guarantee smooth order book conditions for every execution.",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "max_1h_vol_bp": 40.0}
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "max_1h_vol_bp": 40.0}
         },
         {
-            "id": "dd05_cb_vol_combo_45bp",
-            "name": "Stage 5: Circuit Breaker (1h) + Volatility Gate (<45 bp)",
-            "category": "Stage 3: CB + Volatility",
+            "id": "opt06_cb_vol_combo_45bp",
+            "name": "Stage 6: Circuit Breaker (1h) + Volatility Gate (<45 bp)",
+            "category": "Stage 4: CB + Volatility",
             "description": "Combines the 1-hour circuit breaker cooldown with the 45 bp realized ATR gate. Simultaneously eliminates loss clustering and market turbulence.",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0}
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0}
         },
         {
-            "id": "dd06_cb_vol_combo_40bp",
-            "name": "Stage 6: Circuit Breaker (1h) + Stricter Volatility (<40 bp)",
-            "category": "Stage 3: CB + Volatility",
-            "description": "Combines 1-hour circuit breaker with strict 40 bp ATR ceiling.",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 40.0}
-        },
-        {
-            "id": "dd07_cb_vol_hours_optimal",
+            "id": "opt07_cb_vol_hours_optimal",
             "name": "Stage 7: CB + Vol (<45 bp) + Skip 18 & 23 UTC Hours (Optimal)",
-            "category": "Stage 4: Optimal Hours (Champion)",
-            "description": "CB + Volatility + skips 18:00 UTC (US cash close) and 23:00 UTC (daily candle roll). Cuts drawdown to 29.4% while generating maximum net profit!",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_hours": [18, 23]}
+            "category": "Stage 5: Optimal Hours (Champion)",
+            "description": "CB + Volatility + skips 18:00 UTC (US cash close) and 23:00 UTC (daily candle roll). Cuts drawdown while generating maximum net profit.",
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_hours": [18, 23]}
         },
         {
-            "id": "dd08_immediate_open_entry",
-            "name": "Stage 8: Immediate Open Entry (+ Anti-Exhaustion <12 bp, Cheap Odds 45c-58c)",
-            "category": "Stage 5: Immediate Open Architecture",
-            "description": "Predicts candle direction at open (t<=45s) via 15m Structural HA flat base/top and Anti-Exhaustion filter (prior 15m body < 12 bp). Enters immediately at cheap odds (45c-58c) delivering 70.5% WR and 2.34 PF.",
-            "params": {
-                "strategy_mode": "immediate_open",
-                "min_entry_second": 0,
-                "max_entry_second": 45,
-                "max_ask": 0.58,
-                "min_ask": 0.40,
-                "use_15m_ha": True,
-                "prior_body_max_bp": 12.0,
-                "circuit_breaker_losses": 2,
-                "pause_markets": 4,
-                "max_1h_vol_bp": 45.0,
-                "skip_hours": [18, 23]
-            }
+            "id": "opt08_anti_exhaustion",
+            "name": "Stage 8: EV + CB + Vol + Hours + Anti-Exhaustion Gate (<12 bp prior body)",
+            "category": "Stage 6: Anti-Exhaustion Gate",
+            "description": "EV + CB + Volatility + Hours + Anti-Exhaustion filter (skips market if prior completed 15m candle was a blowout >= 12 bp).",
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_hours": [18, 23], "prior_body_max_bp": 12.0}
         },
         {
-            "id": "dd09_4h_master_switch",
+            "id": "opt09_4h_master_switch",
             "name": "Stage 9: Drawdown Filter 1 — 4h 0.5% Master Switch",
-            "category": "Stage 6: Drawdown Filter (Macro Switch)",
-            "description": "Immediate Open (+ Anti-Exhaustion <12 bp) gated by the 4h 0.5% Master Switch. Halts live entries whenever trailing 4h Bitcoin absolute move < 0.50%, eliminating flat-consolidation drag and boosting Win Rate to ~73.7%.",
-            "params": {
-                "strategy_mode": "immediate_open",
-                "min_entry_second": 0,
-                "max_entry_second": 45,
-                "max_ask": 0.58,
-                "min_ask": 0.40,
-                "use_15m_ha": True,
-                "prior_body_max_bp": 12.0,
-                "circuit_breaker_losses": 2,
-                "pause_markets": 4,
-                "max_1h_vol_bp": 45.0,
-                "skip_hours": [18, 23],
-                "drawdown_filter": "4h_master_switch",
-                "min_4h_move_pct": 0.50,
-                "require_1h_impulse": False
-            }
+            "category": "Stage 7: Drawdown Filter (Macro Switch)",
+            "description": "EV gated by the 4h 0.5% Master Switch. Halts entries whenever trailing 4h Bitcoin absolute move < 0.50%, eliminating flat-consolidation drag.",
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_hours": [18, 23], "prior_body_max_bp": 12.0, "drawdown_filter": "4h_master_switch", "min_4h_move_pct": 0.50, "require_1h_impulse": False}
         },
         {
-            "id": "dd10_variant_b_1h_impulse",
+            "id": "opt10_variant_b_1h_impulse",
             "name": "Stage 10: Drawdown Filter 2 — Variant B 1h Impulse (4h 0.5% + 1h Impulse)",
-            "category": "Stage 6: Drawdown Filter (1h Impulse)",
-            "description": "Immediate Open (+ Anti-Exhaustion <12 bp) with Variant B: requires 4h move >= 0.50% AND trailing 1-hour signed move is in impulse mode (outside stall corridor -0.19% to +0.32%). Reaches peak regime purity with ~75.1% win rate.",
-            "params": {
-                "strategy_mode": "immediate_open",
-                "min_entry_second": 0,
-                "max_entry_second": 45,
-                "max_ask": 0.58,
-                "min_ask": 0.40,
-                "use_15m_ha": True,
-                "prior_body_max_bp": 12.0,
-                "circuit_breaker_losses": 2,
-                "pause_markets": 4,
-                "max_1h_vol_bp": 45.0,
-                "skip_hours": [18, 23],
-                "drawdown_filter": "variant_b_1h_impulse",
-                "min_4h_move_pct": 0.50,
-                "require_1h_impulse": True,
-                "impulse_1h_down_pct": -0.19,
-                "impulse_1h_up_pct": 0.32
-            }
+            "category": "Stage 7: Drawdown Filter (1h Impulse)",
+            "description": "EV requiring 4h move >= 0.50% AND trailing 1-hour signed move is in impulse mode (outside stall corridor -0.19% to +0.32%).",
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_hours": [18, 23], "prior_body_max_bp": 12.0, "drawdown_filter": "variant_b_1h_impulse", "min_4h_move_pct": 0.50, "require_1h_impulse": True, "impulse_1h_down_pct": -0.19, "impulse_1h_up_pct": 0.32}
         },
         {
-            "id": "dd11_cb_vol_days_tuesday",
+            "id": "opt11_cb_vol_days_tuesday",
             "name": "Stage 11: CB + Vol (<45 bp) + Skip Tuesday Chop",
-            "category": "Stage 7: Days Filter",
+            "category": "Stage 8: Days Filter",
             "description": "CB + Volatility + pauses trading on Tuesdays (day with highest historical loss concentration).",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_days": ["Tuesday"]}
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_days": ["Tuesday"]}
         },
         {
-            "id": "dd12_cb_vol_days_tue_thu",
+            "id": "opt12_cb_vol_days_tue_thu",
             "name": "Stage 12: CB + Vol (<45 bp) + Skip Tue & Thu Chop",
-            "category": "Stage 7: Days Filter",
+            "category": "Stage 8: Days Filter",
             "description": "CB + Volatility + pauses trading on Tuesdays and Thursdays (mid-week institutional options roll chop).",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_days": ["Tuesday", "Thursday"]}
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_days": ["Tuesday", "Thursday"]}
         },
         {
-            "id": "dd13_cb_vol_sessions_asia_us",
+            "id": "opt13_cb_vol_sessions_asia_us",
             "name": "Stage 13: CB + Vol (<45 bp) + Asia & US Sessions",
-            "category": "Stage 8: Sessions Filter",
+            "category": "Stage 9: Sessions Filter",
             "description": "CB + Volatility + trades only Asia (00:00-08:00 UTC) and US (16:00-24:00 UTC) sessions, bypassing European overlap chop.",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "allowed_sessions": ["Asia", "US"]}
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "allowed_sessions": ["Asia", "US"]}
         },
         {
-            "id": "dd14_comprehensive_fortress",
+            "id": "opt14_comprehensive_fortress",
             "name": "Stage 14: Comprehensive Multi-Filter Suite (CB + Vol + Hours + Tue/Thu)",
-            "category": "Stage 9: Multi-Filter Suite",
-            "description": "Comprehensive defense: Circuit Breaker + Volatility Gate (<45 bp) + Skip Transition Hours (18 & 23 UTC) + Skip Tue & Thu Chop. Peak win rate (87.3%) and profit factor (1.83)!",
-            "params": {"min_strike_distance_bp": 6.0, "use_15m_ha": True, "min_entry_second": 90, "max_entry_second": 600, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_days": ["Tuesday", "Thursday"], "skip_hours": [18, 23]}
+            "category": "Stage 10: Multi-Filter Suite",
+            "description": "Comprehensive defense: Circuit Breaker + Volatility Gate (<45 bp) + Skip Transition Hours (18 & 23 UTC) + Skip Tue & Thu Chop.",
+            "params": {**base_ev, "min_strike_distance_bp": 6.0, "circuit_breaker_losses": 2, "pause_markets": 4, "max_1h_vol_bp": 45.0, "skip_days": ["Tuesday", "Thursday"], "skip_hours": [18, 23]}
         }
     ]
 
 
 
 def run_optimization_suite(data_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    """Runs the Drawdown Reduction Progression strategies with Vetoes ON and OFF (24 runs) and generates full analytics."""
+    """Runs the Drawdown Reduction Progression strategies with Vetoes ON and OFF (28 runs) and generates full analytics."""
     print(f"\n[Optimization] Loading dataset from {data_path}...")
     table = pq.read_table(data_path)
     df = table.to_pandas()
@@ -879,7 +1059,8 @@ def run_optimization_suite(data_path: str, config: Dict[str, Any]) -> Dict[str, 
     regime_diagnostics = analyze_regimes_fast(dataset, config)
 
     # 2. Run Filter Matrix
-    strategy_defs = define_optimization_matrix()
+    strat_cfg = config.get("strategy", {})
+    strategy_defs = define_optimization_matrix(strat_cfg)
     all_results: List[Dict[str, Any]] = []
     veto_comparison: List[Dict[str, Any]] = []
 
@@ -1221,9 +1402,11 @@ def export_optimization_report(suite_results: Dict[str, Any], output_dir: str):
 
 # Drawdown Suite Strategy Definitions
 def define_drawdown_strategies(strat_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Defines all drawdown filter strategies evaluated on the FULL EV model (0-840s window, NO 15m HA structure)."""
+    """Defines all drawdown filter strategies evaluated on the FULL EV model (uncapped window, NO 15m HA structure)."""
     ev_th = float(strat_cfg.get("ev_threshold", 0.04))
     min_prob = float(strat_cfg.get("min_prob", 0.55))
+    min_ts = int(strat_cfg.get("min_entry_second", 0) or 0)
+    max_ts = int(strat_cfg.get("max_entry_second", 880))
     min_seconds_left = int(strat_cfg.get("min_seconds_left", 20))
     circuit_breaker_losses = int(strat_cfg.get("circuit_breaker_losses", 2))
     pause_markets = int(strat_cfg.get("pause_markets", 4))
@@ -1237,8 +1420,8 @@ def define_drawdown_strategies(strat_cfg: Dict[str, Any]) -> List[Dict[str, Any]
         "strategy_mode": "ev_momentum",
         "ev_threshold": ev_th,
         "min_prob": min_prob,
-        "min_entry_second": 0,
-        "max_entry_second": 840,
+        "min_entry_second": min_ts,
+        "max_entry_second": max_ts,
         "min_seconds_left": min_seconds_left,
         "min_strike_distance_bp": 0.0,
         "use_15m_ha": False,
@@ -1252,9 +1435,9 @@ def define_drawdown_strategies(strat_cfg: Dict[str, Any]) -> List[Dict[str, Any]
     return [
         {
             "id": "dd00_unprotected_full_ev_baseline",
-            "name": "Full EV Baseline (Original Unprotected 0-840s EV Model, 0 bp Moneyness)",
+            "name": "Full EV Baseline (Original Unprotected EV Model, 0 bp Moneyness)",
             "category": "Full EV Benchmark",
-            "description": "Pure Full EV model across the entire 0-840s window with NO moneyness gate, NO 15m HA structure, and NO pause/volatility filters. The original reference benchmark.",
+            "description": "Pure Full EV model across the entire uncapped window with NO moneyness gate, NO 15m HA structure, and NO pause/volatility filters. The original reference benchmark.",
             "params": dict(base_ev)
         },
         {
@@ -1269,14 +1452,14 @@ def define_drawdown_strategies(strat_cfg: Dict[str, Any]) -> List[Dict[str, Any]
             "name": "Drawdown Filter 1: Full EV + 4h 0.5% Master Switch",
             "category": "Macro Regime Switch",
             "description": "Full EV model gated by trailing 4h Bitcoin absolute move >= 0.50%. Bypasses dead consolidation drag where 100 flat trades shrink equity by -41%.",
-            "params": {**base_ev, "min_4h_move_pct": min_4h_move_pct, "require_1h_impulse": False}
+            "params": {**base_ev, "drawdown_filter": "4h_master_switch", "min_4h_move_pct": min_4h_move_pct, "require_1h_impulse": False}
         },
         {
             "id": "dd02_variant_b_1h_impulse",
             "name": "Drawdown Filter 2: Full EV + Variant B 1h Impulse",
             "category": "Macro + Impulse Gating",
             "description": "Full EV requiring 4h move >= 0.50% AND trailing 1h signed move is in impulse mode (outside stall corridor -0.19% to +0.32%).",
-            "params": {**base_ev, "min_4h_move_pct": min_4h_move_pct, "require_1h_impulse": True, "impulse_1h_down_pct": impulse_1h_down_pct, "impulse_1h_up_pct": impulse_1h_up_pct}
+            "params": {**base_ev, "drawdown_filter": "variant_b_1h_impulse", "min_4h_move_pct": min_4h_move_pct, "require_1h_impulse": True, "impulse_1h_down_pct": impulse_1h_down_pct, "impulse_1h_up_pct": impulse_1h_up_pct}
         },
         {
             "id": "dd03_circuit_breaker_alone",
@@ -1436,13 +1619,18 @@ def run_simulation(data_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
             use_vetoes_val = strat_cfg.get("use_vetoes", True)
         use_vetoes = bool(use_vetoes_val)
 
+        flip_cfg = config.get("flip", {})
+        flip_enabled = bool(flip_cfg.get("enabled", False))
+        flip_min_conviction = float(flip_cfg.get("min_conviction", 0.80))
+        flip_min_minutes_left = float(flip_cfg.get("min_minutes_left", 9.0))
+
         params = {
-            "name": f"Original Strategy (EV Model | Vetoes {'ON' if use_vetoes else 'OFF'})",
+            "name": f"Original Strategy (EV Model | Vetoes {'ON' if use_vetoes else 'OFF'} | Flip {'ON' if flip_enabled else 'OFF'})",
             "strategy_mode": strategy_mode,
             "ev_threshold": float(strat_cfg.get("ev_threshold", 0.04)),
             "min_prob": float(strat_cfg.get("min_prob", 0.55)),
-            "min_entry_second": 0,
-            "max_entry_second": 840,
+            "min_entry_second": int(strat_cfg.get("min_entry_second", 0) or 0),
+            "max_entry_second": int(strat_cfg.get("max_entry_second", 880)),
             "min_seconds_left": int(strat_cfg.get("min_seconds_left", 20)),
             "min_strike_distance_bp": 0.0,  # Zeroed out: Moneyness Gate was not part of original strategy, moved to optimization_mode
             "use_15m_ha": False,
@@ -1458,16 +1646,21 @@ def run_simulation(data_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
             "min_4h_move_pct": 0.0,
             "require_1h_impulse": False,
             "min_ask": 0.0,
-            "max_ask": 1.0
+            "max_ask": 1.0,
+            "flip_enabled": flip_enabled,
+            "flip_min_conviction": flip_min_conviction,
+            "flip_min_minutes_left": flip_min_minutes_left,
         }
         res = simulate_strategy_fast(dataset, params, config)
-        mode_label = f"ORIGINAL STRATEGY: {'EV + 1M VETO FILTERS (RSI & HA enabled)' if use_vetoes else 'PURE EV (Vetoes DISABLED)'}"
+        mode_label = f"ORIGINAL STRATEGY: {'EV + 1M VETO FILTERS (RSI & HA enabled)' if use_vetoes else 'PURE EV (Vetoes DISABLED)'} | FLIP {'ON' if flip_enabled else 'OFF'}"
         return {
             "mode": "single",
             "drawdown_mode": False,
             "summary": {
                 "mode_label": mode_label,
                 "use_vetoes": params["use_vetoes"],
+                "flip_enabled": flip_enabled,
+                "flips_count": res.get("flips_count", 0),
                 "veto_count": res.get("vetoed_count", 0),
                 "initial_balance": float(config.get("initial_balance", 1000.0)),
                 "final_balance": res["final_balance"],
@@ -1648,6 +1841,7 @@ def export_results(results: Dict[str, Any], output_dir: str):
             f"| **Max Drawdown** | -${s.get('max_drawdown'):,.2f} (-{s.get('max_drawdown_pct'):.2f}%) |",
             f"| **Total Evaluated Markets** | {s.get('markets_evaluated'):,} |",
             f"| **Total Executed Trades** | {s.get('total_trades'):,} ({s.get('trade_frequency_pct')}% market participation) |",
+            f"| **Position Flips Executed** | {s.get('flips_count', 0):,} |",
             f"| **Signals Vetoed by Filters** | {s.get('veto_count'):,} |",
             f"| **Win Rate** | **{s.get('win_rate')}%** ({s.get('winning_trades')} Wins / {s.get('losing_trades')} Losses) |",
             f"| **Profit Factor** | **{s.get('profit_factor')}** |",

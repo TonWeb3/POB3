@@ -30,6 +30,7 @@ python main.py
 
 ```json
 {
+  "binance_futures": false,
   "optimization_mode": true,
   "start_date": "2026-07-21",
   "end_date": "2026-08-19",
@@ -42,7 +43,7 @@ python main.py
     "ev_threshold": 0.04,
     "min_prob": 0.55,
     "min_entry_second": 0,
-    "max_entry_second": 840,
+    "max_entry_second": 880,
     "min_seconds_left": 20
   },
   "use_vetoes": true,
@@ -68,6 +69,7 @@ python main.py
 
 | Field | Type | Description |
 | :--- | :---: | :--- |
+| `binance_futures` | `bool` | Set `false` (default) to use **Binance Spot** (`BTCUSDT-aggTrades` & `1m klines`, matching original `TOG-main`). Set `true` to use **Binance USDT-M Futures** (`futures/um`, matching `FOK-main` leading BBO feed). |
 | `optimization_mode` | `bool` | Set `true` to run the multi-strategy optimization suite (evaluates Moneyness Gate, Circuit Breakers, Volatility Gates, and Hours). Set `false` for standard single backtest. |
 | `drawdown_mode` | `bool` | Used when `optimization_mode` is `false`. Set `true` to run the Drawdown Suite. Set `false` to test the **Original Strategy Baseline** (pure unmitigated EV model, 0 bp Moneyness Gate). |
 | `start_date` / `end_date` | `string` | Date range (`YYYY-MM-DD`). Automatically fetches new data if not cached. |
@@ -174,7 +176,7 @@ All results are automatically generated in the directory specified by `output_di
    ```bash
    pip install -r requirements.txt
    ```
-   *(Requires standard libraries: `pandas`, `numpy`, `pyarrow`, `requests`)*
+   *(Requires standard libraries: `pandas`, `numpy`, `pyarrow`, `requests`, `scipy`, `ta`)*
 
 3. Run the system:
    ```bash
